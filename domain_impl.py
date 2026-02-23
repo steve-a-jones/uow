@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Callable, Optional, Protocol, TypeAlias
+from typing import Callable, Optional, TypeAlias
 from sqlalchemy import ForeignKey, create_engine
 from sqlalchemy.orm import (
     DeclarativeBase,
@@ -70,9 +70,9 @@ class SqlAlchemyAuditRepo(AuditRepo):
 
 @dataclass(frozen=True)
 class UowDeps:
-    users: UserRepo
-    invoices: InvoiceRepo
-    audit: AuditRepo
+    user_repo: UserRepo
+    invoice_repo: InvoiceRepo
+    audit_repo: AuditRepo
 
 class SqlAlchemyUnitOfWork(UnitOfWork):
     def __init__(
@@ -93,9 +93,9 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._session.begin()
 
         deps = self._deps_factory(self._session)
-        self.users = deps.users
-        self.invoices = deps.invoices
-        self.audit = deps.audit
+        self.users = deps.user_repo
+        self.invoices = deps.invoice_repo
+        self.audit = deps.audit_repo
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -115,15 +115,23 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
 
 UowFactory: TypeAlias = Callable[[], UnitOfWork]
 
-def make_uow_factory(SessionFactory: sessionmaker) -> UowFactory:
+def make_uow_factory(session_factory: sessionmaker) -> UowFactory:
     def deps_factory(s: Session) -> UowDeps:
         return UowDeps(
-            users=SqlAlchemyUserRepo(s),
-            invoices=SqlAlchemyInvoiceRepo(s),
-            audit=SqlAlchemyAuditRepo(s),
+            user_repo=SqlAlchemyUserRepo(s),
+            invoice_repo=SqlAlchemyInvoiceRepo(s),
+            audit_repo=SqlAlchemyAuditRepo(s),
         )
 
-    return lambda: SqlAlchemyUnitOfWork(SessionFactory, deps_factory)
+    return lambda: SqlAlchemyUnitOfWork(session_factory, deps_factory)
+
+def create_uow():
+    engine = create_engine("sqlite+pysqlite:///workflow_with_uow.sqlite", future=True)
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, future=True)
+    uow_factory = make_uow_factory(session_factory)
+    return uow_factory()
+
 
 # ---------- READ THIS ------------------
 # Unit Of Work = "Workers" (dependencies -- we use "repos" here, but that's not the point, could be services, etc..) that all SHARE and ADHERE
