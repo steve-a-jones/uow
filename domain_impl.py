@@ -1,80 +1,67 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Callable, Optional, TypeAlias
-from sqlalchemy import ForeignKey, create_engine
-from sqlalchemy.orm import (
-    DeclarativeBase,
-    Mapped,
-    Session,
-    mapped_column,
-    sessionmaker,
-)
+from typing import Callable, Optional
+from sqlalchemy import create_engine
+from sqlalchemy.orm import Session, sessionmaker
+
+from db_models import Base, DBUserRow
 
 # DOMAIN MODELS TO IMPLEMENT
-from domain_models import UnitOfWork, InvoiceRepo, AuditRepo, UserRepo
-
-class Base(DeclarativeBase):
-    pass
-
-class UserRow(Base):
-    __tablename__ = "users"
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    email: Mapped[str]
-
-
-class InvoiceRow(Base):
-    __tablename__ = "invoices"
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    amount_cents: Mapped[int]
-
-
-class AuditRow(Base):
-    __tablename__ = "audit"
-    id: Mapped[int] = mapped_column(primary_key=True, autoincrement=True)
-    message: Mapped[str]
+from domain_models import (
+    IAuditRepo,
+    IInvoiceRepo,
+    IUnitOfWork,
+    IUserRepo,
+    AuditEntry,
+    Invoice,
+    NewInvoice,
+    NewUser,
+    User,
+    UowFactory,
+)
+from mappers import DomainEntityMapper
 
 
 # IMPLEMENTATIONS
-class SqlAlchemyUserRepo(UserRepo):
+class SqlAlchemyUserRepo(IUserRepo):
     def __init__(self, session: Session):
         self._s = session
 
-    def get_email(self, user_id: int) -> Optional[str]:
-        row = self._s.get(UserRow, user_id)
-        return row.email if row else None
+    def get(self, user_id: int) -> Optional[User]:
+        row = self._s.get(DBUserRow, user_id)
+        return DomainEntityMapper.user_row_to_domain(row) if row else None
 
-    def add_user(self, email: str) -> int:
-        row = UserRow(email=email)
+    def add(self, user: NewUser) -> User:
+        row = DomainEntityMapper.new_user_to_row(user)
         self._s.add(row)
         self._s.flush()  # ensures row.id assigned
-        return row.id
+        return DomainEntityMapper.user_row_to_domain(row)
 
-class SqlAlchemyInvoiceRepo(InvoiceRepo):
+class SqlAlchemyInvoiceRepo(IInvoiceRepo):
     def __init__(self, session: Session):
         self._s = session
 
-    def add_invoice(self, user_id: int, amount_cents: int) -> int:
-        row = InvoiceRow(user_id=user_id, amount_cents=amount_cents)
+    def add(self, invoice: NewInvoice) -> Invoice:
+        row = DomainEntityMapper.new_invoice_to_row(invoice)
         self._s.add(row)
         self._s.flush()
-        return row.id
+        return DomainEntityMapper.invoice_row_to_domain(row)
 
-class SqlAlchemyAuditRepo(AuditRepo):
+class SqlAlchemyAuditRepo(IAuditRepo):
     def __init__(self, session: Session):
         self._s = session
 
-    def record(self, message: str) -> None:
-        self._s.add(AuditRow(message=message))
+    def record(self, entry: AuditEntry) -> None:
+        self._s.add(DomainEntityMapper.audit_entry_to_row(entry))
         # no flush needed
 
 @dataclass(frozen=True)
 class UowDeps:
-    user_repo: UserRepo
-    invoice_repo: InvoiceRepo
-    audit_repo: AuditRepo
+    user_repo: IUserRepo
+    invoice_repo: IInvoiceRepo
+    audit_repo: IAuditRepo
 
-class SqlAlchemyUnitOfWork(UnitOfWork):
+class SqlAlchemyUnitOfWork(IUnitOfWork):
     def __init__(
         self,
         session_factory: Callable[[], Session],
@@ -84,18 +71,18 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
         self._deps_factory = deps_factory
         self._session: Optional[Session] = None
 
-        self.users: UserRepo
-        self.invoices: InvoiceRepo
-        self.audit: AuditRepo
+        self.user_repo: IUserRepo
+        self.invoice_repo: IInvoiceRepo
+        self.audit_repo: IAuditRepo
 
     def __enter__(self) -> "SqlAlchemyUnitOfWork":
         self._session = self._sf()
         self._session.begin()
 
         deps = self._deps_factory(self._session)
-        self.users = deps.user_repo
-        self.invoices = deps.invoice_repo
-        self.audit = deps.audit_repo
+        self.user_repo = deps.user_repo
+        self.invoice_repo = deps.invoice_repo
+        self.audit_repo = deps.audit_repo
         return self
 
     def __exit__(self, exc_type, exc, tb) -> bool:
@@ -112,8 +99,6 @@ class SqlAlchemyUnitOfWork(UnitOfWork):
     def flush(self) -> None:
         assert self._session is not None
         self._session.flush()
-
-UowFactory: TypeAlias = Callable[[], UnitOfWork]
 
 def make_uow_factory(session_factory: sessionmaker) -> UowFactory:
     def deps_factory(s: Session) -> UowDeps:
@@ -151,7 +136,7 @@ def create_uow():
 #     we HAVE TO FIND A WAY TO EXTEND OUR BUSINESS DOMAIN -- THIS WILL HAPPEN AND IT'S OK.
 
 # 3) Consumers that use these repos only see the interfaces (which serve the business domain)
-# and are relieved of the burden of speaking in specifics about things like sessions and concrete db entities (like UserRow).
+# and are relieved of the burden of speaking in specifics about things like sessions and concrete db entities (like DBUserRow).
 # REMEMBER: Since the interfaces only service the business domain, their method signatures MUST (NO EXCEPTION) only allow inputs
 # that belong to the business domain (otherwise, the boundary is broken).
 # e.g.;
@@ -168,16 +153,16 @@ def create_uow():
 # super-glueing themselves to our precious business logic, weighing us down and making it hard for the application to evolve/change
 # without major refactors.
 # class ClaimRepo(Protocol):
-#     def get_claim_by_id(self, claim_id: int) -> IDBClaim: ...
-#     def update_claim(self, claim: IClaim, claim_update_info: IClaimUpdateRequest) -> IDBClaim: ...
+#     def get_claim_by_id(self, claim_id: int) -> DBClaim: ...
+#     def update_claim(self, claim: IClaim, claim_update_info: IClaimUpdateRequest) -> DBClaim: ...
 
 
 # 4) NOTHING IS FREE. The trade-off here (we're honestly lucky that the cost is so low for the value we get in return)
 # is that we must now find way to "cross the line" from our abstract business domain to the concrete world where concrete specifics (like DB entities)
 # matter. DOMAIN ENTITY MAPPERS are needed, but they are easier to manage (AND TEST, #DO_IT_WITH_AI) and are pure functions that simply map types --
 # e.g.;
-# IClaimToIDbClaim(claim: IClaim) -> IDbClaim
-# IDbClaimToIClaim(dbClaim: IDbClaim) -> IClaim
+# IClaimToDBClaim(claim: IClaim) -> DBClaim
+# DBClaimToIClaim(dbClaim: DBClaim) -> IClaim
 # **NOTE** Mappers reside where domain reconstruction is needed (so they reside near the implementation specifics) **
 
 # In practice this would look something like...
